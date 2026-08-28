@@ -1,0 +1,979 @@
+#!/usr/bin/env python3
+
+import argparse
+import curses
+import re
+import shutil
+import subprocess
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+
+# ----------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------
+
+DEFAULT_INTERVAL = 2.0
+
+SYMBOL_IDLE = "."
+SYMBOL_ALLOC = "#"
+SYMBOL_OTHER = "!"
+SYMBOL_DOWN = "X"
+SYMBOL_DRAIN = "D"
+SYMBOL_MAINT = "M"
+
+STATE_WIDTH = 11
+NODE_NAME_WIDTH = 14
+
+
+# ----------------------------------------------------------------------
+# Data structures
+# ----------------------------------------------------------------------
+
+@dataclass
+class Node:
+    name: str
+    state: str
+    allocated: int
+    idle: int
+    other: int
+    total: int
+
+
+@dataclass
+class Job:
+    jobid: str
+    user: str
+    partition: str
+    name: str
+    elapsed: str
+    nodes: int
+    cpus: int
+    nodelist: str
+
+    cpu_percent: Optional[float] = None
+    ave_rss_kib: Optional[float] = None
+    max_rss_kib: Optional[float] = None
+
+
+# ----------------------------------------------------------------------
+# Slurm command execution
+# ----------------------------------------------------------------------
+
+def run_command(args):
+    try:
+        proc = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+        if proc.returncode != 0:
+            return ""
+
+        return proc.stdout
+
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+# ----------------------------------------------------------------------
+# Nodes
+# ----------------------------------------------------------------------
+
+def read_nodes():
+    """
+    sinfo %C:
+        allocated / idle / other / total
+
+    -N may list a node several times if it belongs to multiple partitions.
+    We therefore de-duplicate by node name.
+    """
+
+    output = run_command([
+        "sinfo",
+        "-N",
+        "-h",
+        "-o",
+        "%N|%T|%C"
+    ])
+
+    nodes = {}
+
+    for line in output.splitlines():
+
+        parts = line.strip().split("|")
+
+        if len(parts) != 3:
+            continue
+
+        name, state, cpuinfo = parts
+
+        try:
+            alloc, idle, other, total = [
+                int(x) for x in cpuinfo.split("/")
+            ]
+        except (ValueError, TypeError):
+            continue
+
+        node = Node(
+            name=name,
+            state=state,
+            allocated=alloc,
+            idle=idle,
+            other=other,
+            total=total,
+        )
+
+        # sinfo -N can return the node several times for different partitions.
+        # Since the CPU state should be identical, one entry is sufficient.
+        nodes[name] = node
+
+    return sorted(nodes.values(), key=lambda n: natural_sort_key(n.name))
+
+
+# ----------------------------------------------------------------------
+# Jobs
+# ----------------------------------------------------------------------
+
+def read_jobs(user_filter=None, partition_filter=None):
+
+    output = run_command([
+        "squeue",
+        "-h",
+        "-t",
+        "RUNNING",
+        "-o",
+        "%i|%u|%P|%j|%M|%D|%C|%R"
+    ])
+
+    jobs = []
+
+    for line in output.splitlines():
+
+        parts = line.rstrip().split("|", 7)
+
+        if len(parts) != 8:
+            continue
+
+        jobid, user, partition, name, elapsed, nodes, cpus, nodelist = parts
+
+        # "*" is sometimes appended to the default partition
+        partition = partition.rstrip("*")
+
+        if user_filter:
+            if user not in user_filter:
+                continue
+
+        if partition_filter:
+            if partition not in partition_filter:
+                continue
+
+        try:
+            nnodes = int(nodes)
+        except ValueError:
+            nnodes = 0
+
+        try:
+            ncpus = int(cpus)
+        except ValueError:
+            ncpus = 0
+
+        jobs.append(
+            Job(
+                jobid=jobid,
+                user=user,
+                partition=partition,
+                name=name,
+                elapsed=elapsed,
+                nodes=nnodes,
+                cpus=ncpus,
+                nodelist=nodelist,
+            )
+        )
+
+    read_job_statistics(jobs)
+
+    return jobs
+
+
+# ----------------------------------------------------------------------
+# sstat information
+# ----------------------------------------------------------------------
+
+def read_job_statistics(jobs):
+
+    if not jobs:
+        return
+
+    # sstat accepts comma-separated Job IDs.
+    jobids = ",".join(j.jobid for j in jobs)
+
+    output = run_command([
+        "sstat",
+        "-a",
+        "-n",
+        "-P",
+        "-j",
+        jobids,
+        "--format=JobIDRaw,AveCPU,AveRSS,MaxRSS",
+    ])
+
+    # Statistics indexed by base Job ID
+    stats = {}
+
+    for line in output.splitlines():
+
+        fields = line.strip().split("|")
+
+        if len(fields) < 4:
+            continue
+
+        jobstep, ave_cpu, ave_rss, max_rss = fields[:4]
+
+        # e.g.
+        # 12345.batch
+        # 12345.extern
+        # 12345.0
+        #
+        # Array jobs can look like:
+        # 12345_7.batch
+
+        base_jobid = jobstep.split(".", 1)[0]
+
+        cpu_seconds = parse_slurm_time(ave_cpu)
+        ave_rss_kib = parse_memory(ave_rss)
+        max_rss_kib = parse_memory(max_rss)
+
+        entry = stats.setdefault(
+            base_jobid,
+            {
+                "cpu_seconds": None,
+                "ave_rss": None,
+                "max_rss": None,
+            }
+        )
+
+        # Several steps can exist. For the dashboard we use the largest
+        # observed values. This is usually the most useful value for
+        # batch jobs.
+        if cpu_seconds is not None:
+            if entry["cpu_seconds"] is None:
+                entry["cpu_seconds"] = cpu_seconds
+            else:
+                entry["cpu_seconds"] = max(
+                    entry["cpu_seconds"], cpu_seconds
+                )
+
+        if ave_rss_kib is not None:
+            if entry["ave_rss"] is None:
+                entry["ave_rss"] = ave_rss_kib
+            else:
+                entry["ave_rss"] = max(
+                    entry["ave_rss"], ave_rss_kib
+                )
+
+        if max_rss_kib is not None:
+            if entry["max_rss"] is None:
+                entry["max_rss"] = max_rss_kib
+            else:
+                entry["max_rss"] = max(
+                    entry["max_rss"], max_rss_kib
+                )
+
+    for job in jobs:
+
+        st = stats.get(job.jobid)
+
+        if not st:
+            continue
+
+        job.ave_rss_kib = st["ave_rss"]
+        job.max_rss_kib = st["max_rss"]
+
+        elapsed_seconds = parse_slurm_time(job.elapsed)
+
+        if (
+            elapsed_seconds
+            and elapsed_seconds > 0
+            and st["cpu_seconds"] is not None
+        ):
+            #
+            # AveCPU from sstat is average CPU time per task.
+            # Hence this is an average task utilization rather than the
+            # aggregate utilization of all allocated CPUs.
+            #
+            job.cpu_percent = (
+                100.0 * st["cpu_seconds"] / elapsed_seconds
+            )
+
+
+# ----------------------------------------------------------------------
+# Parsing helpers
+# ----------------------------------------------------------------------
+
+def parse_slurm_time(value):
+    """
+    Parse:
+        HH:MM:SS
+        D-HH:MM:SS
+        MM:SS
+    """
+
+    if not value:
+        return None
+
+    value = value.strip()
+
+    if not value or value in ("N/A", "Unknown"):
+        return None
+
+    days = 0
+
+    if "-" in value:
+        daypart, value = value.split("-", 1)
+
+        try:
+            days = int(daypart)
+        except ValueError:
+            return None
+
+    fields = value.split(":")
+
+    try:
+        if len(fields) == 3:
+            hours, minutes, seconds = fields
+        elif len(fields) == 2:
+            hours = 0
+            minutes, seconds = fields
+        elif len(fields) == 1:
+            hours = 0
+            minutes = 0
+            seconds = fields[0]
+        else:
+            return None
+
+        return (
+            days * 86400
+            + int(hours) * 3600
+            + int(minutes) * 60
+            + float(seconds)
+        )
+
+    except ValueError:
+        return None
+
+
+def parse_memory(value):
+    """
+    Convert Slurm memory values to KiB.
+
+    Examples:
+        1234K
+        120M
+        3.5G
+    """
+
+    if not value:
+        return None
+
+    value = value.strip()
+
+    if not value or value in ("N/A", "Unknown"):
+        return None
+
+    match = re.match(
+        r"^([0-9.]+)\s*([KMGTPE]?)B?$",
+        value,
+        re.IGNORECASE
+    )
+
+    if not match:
+        return None
+
+    try:
+        number = float(match.group(1))
+    except ValueError:
+        return None
+
+    unit = match.group(2).upper()
+
+    multiplier = {
+        "": 1.0 / 1024.0,   # Slurm normally returns K, but be defensive
+        "K": 1.0,
+        "M": 1024.0,
+        "G": 1024.0 ** 2,
+        "T": 1024.0 ** 3,
+        "P": 1024.0 ** 4,
+        "E": 1024.0 ** 5,
+    }.get(unit)
+
+    if multiplier is None:
+        return None
+
+    return number * multiplier
+
+
+def human_memory(kib):
+
+    if kib is None:
+        return "-"
+
+    units = ["K", "M", "G", "T", "P"]
+
+    value = kib
+    unit = units[0]
+
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            break
+
+        value /= 1024.0
+
+    if value >= 100:
+        return f"{value:5.0f}{unit}"
+
+    if value >= 10:
+        return f"{value:5.1f}{unit}"
+
+    return f"{value:5.2f}{unit}"
+
+
+def natural_sort_key(text):
+
+    return [
+        int(chunk) if chunk.isdigit() else chunk.lower()
+        for chunk in re.split(r"([0-9]+)", text)
+    ]
+
+
+# ----------------------------------------------------------------------
+# Node visualization
+# ----------------------------------------------------------------------
+
+def normalize_state(state):
+
+    # Remove Slurm state suffix characters such as:
+    # * ~ # + $
+    return re.sub(r"[^A-Za-z_]", "", state).lower()
+
+
+def node_core_string(node):
+
+    state = normalize_state(node.state)
+
+    if "down" in state or "fail" in state:
+        return SYMBOL_DOWN * node.total
+
+    if "drain" in state:
+        return SYMBOL_DRAIN * node.total
+
+    if "maint" in state:
+        return SYMBOL_MAINT * node.total
+
+    return (
+        SYMBOL_ALLOC * node.allocated
+        + SYMBOL_IDLE * node.idle
+        + SYMBOL_OTHER * node.other
+    )
+
+
+# ----------------------------------------------------------------------
+# Curses helpers
+# ----------------------------------------------------------------------
+
+def safe_addstr(win, y, x, text, attr=0):
+
+    try:
+        height, width = win.getmaxyx()
+
+        if y < 0 or y >= height:
+            return
+
+        if x < 0 or x >= width:
+            return
+
+        maxlen = width - x - 1
+
+        if maxlen <= 0:
+            return
+
+        win.addnstr(y, x, str(text), maxlen, attr)
+
+    except curses.error:
+        pass
+
+
+def prompt(stdscr, message):
+
+    height, width = stdscr.getmaxyx()
+
+    curses.echo()
+    curses.curs_set(1)
+
+    try:
+        stdscr.move(height - 1, 0)
+        stdscr.clrtoeol()
+
+        safe_addstr(
+            stdscr,
+            height - 1,
+            0,
+            message,
+            curses.A_BOLD,
+        )
+
+        stdscr.refresh()
+
+        maxlen = max(1, width - len(message) - 2)
+
+        value = stdscr.getstr(
+            height - 1,
+            min(len(message), width - 2),
+            maxlen,
+        )
+
+        return value.decode(
+            "utf-8",
+            errors="replace"
+        ).strip()
+
+    except curses.error:
+        return ""
+
+    finally:
+        curses.noecho()
+
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+
+
+# ----------------------------------------------------------------------
+# Screen rendering
+# ----------------------------------------------------------------------
+
+def draw_screen(
+    stdscr,
+    nodes,
+    jobs,
+    user_filter,
+    partition_filter,
+    job_scroll,
+    interval,
+):
+
+    stdscr.erase()
+
+    height, width = stdscr.getmaxyx()
+
+    # ------------------------------------------------------------------
+    # Header
+    # ------------------------------------------------------------------
+
+    title = "slurmtop"
+
+    filter_text = []
+
+    if user_filter:
+        filter_text.append("user=" + ",".join(sorted(user_filter)))
+
+    if partition_filter:
+        filter_text.append(
+            "partition=" + ",".join(sorted(partition_filter))
+        )
+
+    filters = "  ".join(filter_text)
+
+    header = title
+
+    if filters:
+        header += "   [" + filters + "]"
+
+    safe_addstr(
+        stdscr,
+        0,
+        0,
+        header,
+        curses.A_BOLD,
+    )
+
+    # ------------------------------------------------------------------
+    # Node area
+    # ------------------------------------------------------------------
+
+    y = 2
+
+    safe_addstr(
+        stdscr,
+        y,
+        0,
+        "NODES",
+        curses.A_BOLD | curses.A_UNDERLINE,
+    )
+
+    y += 1
+
+    node_summary = (
+        f"{len(nodes)} nodes    "
+        f"{sum(n.total for n in nodes)} CPUs    "
+        f"{sum(n.allocated for n in nodes)} allocated    "
+        f"{sum(n.idle for n in nodes)} idle"
+    )
+
+    safe_addstr(stdscr, y, 0, node_summary)
+
+    y += 1
+
+    # Roughly upper 40% of terminal for nodes.
+    max_node_lines = max(3, int(height * 0.40) - y)
+
+    visible_nodes = nodes[:max_node_lines]
+
+    for node in visible_nodes:
+
+        cores = node_core_string(node)
+
+        prefix = (
+            f"{node.name:<{NODE_NAME_WIDTH}} "
+            f"{node.state:<{STATE_WIDTH}} "
+        )
+
+        suffix = (
+            f"  "
+            f"{node.allocated}/"
+            f"{node.idle}/"
+            f"{node.other}/"
+            f"{node.total}"
+        )
+
+        available = max(
+            0,
+            width - len(prefix) - len(suffix) - 2
+        )
+
+        if len(cores) > available and available > 3:
+            cores = cores[:available - 3] + "..."
+
+        line = prefix + cores + suffix
+
+        attr = curses.A_NORMAL
+
+        state = normalize_state(node.state)
+
+        if "down" in state or "fail" in state:
+            attr |= curses.A_BOLD
+
+        if "drain" in state:
+            attr |= curses.A_BOLD
+
+        safe_addstr(stdscr, y, 0, line, attr)
+
+        y += 1
+
+    if len(nodes) > len(visible_nodes):
+        safe_addstr(
+            stdscr,
+            y,
+            0,
+            f"... {len(nodes) - len(visible_nodes)} weitere Nodes",
+            curses.A_DIM,
+        )
+        y += 1
+
+    # ------------------------------------------------------------------
+    # Job area
+    # ------------------------------------------------------------------
+
+    y += 1
+
+    safe_addstr(
+        stdscr,
+        y,
+        0,
+        "RUNNING JOBS",
+        curses.A_BOLD | curses.A_UNDERLINE,
+    )
+
+    y += 1
+
+    header_line = (
+        f"{'JOBID':>10} "
+        f"{'USER':<10} "
+        f"{'PARTITION':<12} "
+        f"{'NAME':<18} "
+        f"{'TIME':>10} "
+        f"{'N':>3} "
+        f"{'CPU':>4} "
+        f"{'CPU%':>6} "
+        f"{'RSSavg':>8} "
+        f"{'RSSmax':>8} "
+        f"NODELIST"
+    )
+
+    safe_addstr(
+        stdscr,
+        y,
+        0,
+        header_line,
+        curses.A_REVERSE,
+    )
+
+    y += 1
+
+    available_job_lines = max(
+        0,
+        height - y - 2
+    )
+
+    max_scroll = max(
+        0,
+        len(jobs) - available_job_lines
+    )
+
+    job_scroll = max(
+        0,
+        min(job_scroll, max_scroll)
+    )
+
+    visible_jobs = jobs[
+        job_scroll:job_scroll + available_job_lines
+    ]
+
+    for job in visible_jobs:
+
+        if job.cpu_percent is None:
+            cpu_percent = "-"
+        else:
+            cpu_percent = f"{job.cpu_percent:5.1f}"
+
+        line = (
+            f"{job.jobid:>10.10} "
+            f"{job.user:<10.10} "
+            f"{job.partition:<12.12} "
+            f"{job.name:<18.18} "
+            f"{job.elapsed:>10.10} "
+            f"{job.nodes:>3} "
+            f"{job.cpus:>4} "
+            f"{cpu_percent:>6} "
+            f"{human_memory(job.ave_rss_kib):>8} "
+            f"{human_memory(job.max_rss_kib):>8} "
+            f"{job.nodelist}"
+        )
+
+        safe_addstr(stdscr, y, 0, line)
+
+        y += 1
+
+    # ------------------------------------------------------------------
+    # Footer
+    # ------------------------------------------------------------------
+
+    footer = (
+        f"q quit | u user filter | p partition filter | "
+        f"UP/DOWN scroll | r refresh | interval={interval:g}s    "
+        f". idle  # allocated  ! other  D drain  X down"
+    )
+
+    safe_addstr(
+        stdscr,
+        height - 1,
+        0,
+        footer,
+        curses.A_REVERSE,
+    )
+
+    stdscr.refresh()
+
+    return job_scroll
+
+
+# ----------------------------------------------------------------------
+# Main curses loop
+# ----------------------------------------------------------------------
+
+def curses_main(stdscr, interval):
+
+    curses.curs_set(0)
+    curses.noecho()
+    curses.cbreak()
+
+    stdscr.keypad(True)
+    stdscr.nodelay(True)
+
+    user_filter = None
+    partition_filter = None
+
+    job_scroll = 0
+
+    nodes = []
+    jobs = []
+
+    last_update = 0.0
+
+    while True:
+
+        now = time.monotonic()
+
+        if now - last_update >= interval:
+
+            nodes = read_nodes()
+
+            jobs = read_jobs(
+                user_filter=user_filter,
+                partition_filter=partition_filter,
+            )
+
+            last_update = now
+
+        job_scroll = draw_screen(
+            stdscr,
+            nodes,
+            jobs,
+            user_filter,
+            partition_filter,
+            job_scroll,
+            interval,
+        )
+
+        key = stdscr.getch()
+
+        if key == -1:
+            time.sleep(0.05)
+            continue
+
+        # --------------------------------------------------------------
+        # Quit
+        # --------------------------------------------------------------
+
+        if key in (ord("q"), ord("Q")):
+            break
+
+        # --------------------------------------------------------------
+        # User filter
+        # --------------------------------------------------------------
+
+        elif key in (ord("u"), ord("U")):
+
+            value = prompt(
+                stdscr,
+                "User filter (comma separated; empty = all): "
+            )
+
+            if value:
+                user_filter = {
+                    x.strip()
+                    for x in value.split(",")
+                    if x.strip()
+                }
+            else:
+                user_filter = None
+
+            job_scroll = 0
+            last_update = 0
+
+        # --------------------------------------------------------------
+        # Partition filter
+        # --------------------------------------------------------------
+
+        elif key in (ord("p"), ord("P")):
+
+            value = prompt(
+                stdscr,
+                "Partition filter (comma separated; empty = all): "
+            )
+
+            if value:
+                partition_filter = {
+                    x.strip()
+                    for x in value.split(",")
+                    if x.strip()
+                }
+            else:
+                partition_filter = None
+
+            job_scroll = 0
+            last_update = 0
+
+        # --------------------------------------------------------------
+        # Scroll job list
+        # --------------------------------------------------------------
+
+        elif key == curses.KEY_DOWN:
+            job_scroll += 1
+
+        elif key == curses.KEY_UP:
+            job_scroll = max(0, job_scroll - 1)
+
+        elif key == curses.KEY_NPAGE:
+            height, _ = stdscr.getmaxyx()
+            job_scroll += max(1, height // 2)
+
+        elif key == curses.KEY_PPAGE:
+            height, _ = stdscr.getmaxyx()
+            job_scroll = max(
+                0,
+                job_scroll - max(1, height // 2)
+            )
+
+        elif key in (ord("r"), ord("R")):
+            last_update = 0
+
+        elif key == curses.KEY_RESIZE:
+            pass
+
+
+# ----------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="Interactive Slurm cluster monitor"
+    )
+
+    parser.add_argument(
+        "-i",
+        "--interval",
+        type=float,
+        default=DEFAULT_INTERVAL,
+        help=f"refresh interval in seconds (default: {DEFAULT_INTERVAL})",
+    )
+
+    args = parser.parse_args()
+
+    if args.interval < 0.2:
+        parser.error("refresh interval must be >= 0.2 seconds")
+
+    required = [
+        "sinfo",
+        "squeue",
+        "sstat",
+    ]
+
+    missing = [
+        cmd
+        for cmd in required
+        if shutil.which(cmd) is None
+    ]
+
+    if missing:
+        parser.error(
+            "missing Slurm commands: "
+            + ", ".join(missing)
+        )
+
+    curses.wrapper(
+        curses_main,
+        args.interval,
+    )
+
+
+if __name__ == "__main__":
+    main()
