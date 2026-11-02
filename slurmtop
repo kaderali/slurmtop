@@ -170,7 +170,9 @@ def read_job_memory_reservations(jobs):
 def read_job_statistics(jobs):
     """Collect live job accounting data from sstat.
 
-    For each active step:
+    For each active step, TRESUsageInTot's mem value is the current total RSS
+    reported by Slurm. On Slurm versions/configurations where that field is not
+    available, fall back to:
       total RSS ~= AveRSS * NTasks
       total CPU time ~= AveCPU * NTasks
 
@@ -183,8 +185,18 @@ def read_job_statistics(jobs):
     jobids = ",".join(j.jobid for j in jobs)
     output = run_command([
         "sstat", "-a", "-n", "-P", "-j", jobids,
-        "--format=JobIDRaw,AveCPU,AveRSS,MaxRSS,NTasks",
+        "--format=JobIDRaw,AveCPU,AveRSS,MaxRSS,NTasks,TRESUsageInTot",
     ])
+
+    # TRESUsageInTot is available on supported modern Slurm releases, but a
+    # single unknown format field makes older sstat versions reject the whole
+    # request. Retry without it so CPU and the estimated RSS remain useful.
+    has_tres_usage = bool(output)
+    if not output:
+        output = run_command([
+            "sstat", "-a", "-n", "-P", "-j", jobids,
+            "--format=JobIDRaw,AveCPU,AveRSS,MaxRSS,NTasks",
+        ])
 
     stats = {}
 
@@ -194,6 +206,7 @@ def read_job_statistics(jobs):
             continue
 
         jobstep, ave_cpu, ave_rss, max_rss, ntasks_s = fields[:5]
+        tres_usage = fields[5] if has_tres_usage and len(fields) > 5 else ""
         base_jobid = jobstep.split(".", 1)[0]
 
         try:
@@ -204,6 +217,7 @@ def read_job_statistics(jobs):
         cpu_seconds = parse_slurm_time(ave_cpu)
         ave_rss_kib = parse_memory(ave_rss)
         max_rss_kib = parse_memory(max_rss)
+        total_rss_kib = parse_tres_memory(tres_usage)
 
         entry = stats.setdefault(base_jobid, {
             "cpu_seconds_total": 0.0,
@@ -217,7 +231,10 @@ def read_job_statistics(jobs):
             entry["cpu_seconds_total"] += cpu_seconds * ntasks
             entry["have_cpu"] = True
 
-        if ave_rss_kib is not None and ntasks > 0:
+        if total_rss_kib is not None:
+            entry["rss_total"] += total_rss_kib
+            entry["have_rss"] = True
+        elif ave_rss_kib is not None and ntasks > 0:
             entry["rss_total"] += ave_rss_kib * ntasks
             entry["have_rss"] = True
 
@@ -321,6 +338,18 @@ def parse_memory(value):
     }.get(unit)
 
     return None if multiplier is None else number * multiplier
+
+
+def parse_tres_memory(value):
+    """Return the memory component of a Slurm TRES usage list in KiB."""
+    if not value:
+        return None
+
+    for item in value.split(","):
+        name, separator, amount = item.partition("=")
+        if separator and name.strip().lower() in ("mem", "memory"):
+            return parse_memory(amount)
+    return None
 
 
 def human_memory(kib):

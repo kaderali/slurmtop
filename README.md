@@ -120,12 +120,18 @@ The running-job view provides several memory metrics:
 
 | Column    | Meaning                                                 |
 | --------- | ------------------------------------------------------- |
-| `MEM`     | Estimated aggregate current resident memory of the job  |
+| `MEM`     | Aggregate current resident memory reported for the job  |
 | `MEM/CPU` | Aggregate memory divided by allocated CPUs              |
 | `MAXRSS`  | Largest resident memory observed for an individual task |
 | `MEMRES`  | Memory reserved/allocated by Slurm for the job          |
 
-Slurm reports `AveRSS` for individual job steps. `slurmtop` estimates the aggregate memory usage of each active step as:
+On current Slurm versions, `slurmtop` reads the `mem` value from
+`TRESUsageInTot`. During a job run, Slurm defines this as the total memory
+reported across all tasks in a step. Values for simultaneously active steps
+are added to obtain the displayed job total.
+
+As a compatibility fallback for older Slurm versions, `slurmtop` estimates
+the aggregate memory usage of each active step as:
 
 ```text
 AveRSS × number of tasks
@@ -144,7 +150,11 @@ CPU   CPU%     MEM   MEM/CPU   MAXRSS   MEMRES
 
 indicates that the job has 120 GiB reserved and is currently estimated to use approximately 82.4 GiB of resident memory.
 
-`MAXRSS` remains a per-task value and should not be interpreted as total job memory usage.
+`MAXRSS` remains a per-task high-water mark and should not be interpreted as
+total job memory usage. Depending on the cluster's accounting plugin,
+filesystem cache can be included in the reported memory. Values are refreshed
+at Slurm's accounting sampling interval, which can be slower than the
+`slurmtop` refresh interval.
 
 Resource statistics depend on the Slurm accounting configuration and the privileges of the user running `slurmtop`.
 
