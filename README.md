@@ -157,6 +157,8 @@ at Slurm's accounting sampling interval, which can be slower than the
 `slurmtop` refresh interval.
 
 Resource statistics depend on the Slurm accounting configuration and the privileges of the user running `slurmtop`.
+For compatibility with older Slurm releases, `slurmtop` requests the `JobID`
+field rather than the newer `JobIDRaw` field from `sstat`.
 
 ## Queued Job Display
 

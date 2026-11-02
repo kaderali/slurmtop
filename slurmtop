@@ -185,7 +185,7 @@ def read_job_statistics(jobs):
     jobids = ",".join(j.jobid for j in jobs)
     output = run_command([
         "sstat", "-a", "-n", "-P", "-j", jobids,
-        "--format=JobIDRaw,AveCPU,AveRSS,MaxRSS,NTasks,TRESUsageInTot",
+        "--format=JobID,AveCPU,AveRSS,MaxRSS,NTasks,TRESUsageInTot",
     ])
 
     # TRESUsageInTot is available on supported modern Slurm releases, but a
@@ -195,7 +195,7 @@ def read_job_statistics(jobs):
     if not output:
         output = run_command([
             "sstat", "-a", "-n", "-P", "-j", jobids,
-            "--format=JobIDRaw,AveCPU,AveRSS,MaxRSS,NTasks",
+            "--format=JobID,AveCPU,AveRSS,MaxRSS,NTasks",
         ])
 
     stats = {}

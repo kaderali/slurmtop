@@ -19,6 +19,20 @@ def job(jobid="123", cpus=4):
 
 
 class MemoryStatisticsTests(unittest.TestCase):
+    def test_sstat_uses_portable_jobid_field(self):
+        current = job()
+
+        with mock.patch.object(
+            slurmtop, "run_command", return_value=""
+        ) as run_command:
+            slurmtop.read_job_statistics([current])
+
+        self.assertEqual(run_command.call_count, 2)
+        for call in run_command.call_args_list:
+            format_argument = call.args[0][-1]
+            self.assertTrue(format_argument.startswith("--format=JobID,"))
+            self.assertNotIn("JobIDRaw", format_argument)
+
     def test_tres_total_is_preferred_over_averss_estimate(self):
         current = job()
         output = (
